@@ -36,11 +36,11 @@ struct ContentView: View {
         if store.selected?.trust == .trusted {
             List(selection: $store.selectedApp) {
                 Section("Library") {
-                    Label("Photos", systemImage: "photo.on.rectangle").tag(String?.some(DeviceStore.photosID))
+                    Label("Photos", systemImage: "photo.on.rectangle").tag(DeviceStore.photosID)
                 }
                 Section("File Sharing") {
                     ForEach(store.apps) { app in
-                        Label(app.name, systemImage: "app").tag(String?.some(app.id))
+                        Label(app.name, systemImage: "app").tag(app.id)
                     }
                     if store.loadingApps {
                         ProgressView().controlSize(.small)
@@ -113,42 +113,68 @@ struct SourceView: View {
 
 struct PhotoGallery: View {
     @ObservedObject var model: BrowserModel
+    @State private var choosingDates = false
 
     var body: some View {
         ScrollView {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 4)], spacing: 4, pinnedViews: .sectionHeaders) {
+            LazyVStack(spacing: 0, pinnedViews: .sectionHeaders) {
                 ForEach(model.photoSections) { section in
+                    let open = model.expanded.contains(section.id)
                     Section {
-                        ForEach(section.photos) { photo in
-                            PhotoTile(photo: photo, model: model, selected: model.selection.contains(photo.id))
-                                .onTapGesture(count: 2) { Task { await model.preview(photo) } }
-                                .onTapGesture { select(photo) }
+                        if open {
+                            LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 4)], spacing: 4) {
+                                ForEach(section.photos) { photo in
+                                    PhotoTile(photo: photo, model: model, selected: model.selection.contains(photo.id))
+                                        .onTapGesture(count: 2) { Task { await model.preview(photo) } }
+                                        .onTapGesture {
+                                            let flags = NSEvent.modifierFlags
+                                            model.click(photo, command: flags.contains(.command), shift: flags.contains(.shift))
+                                        }
+                                }
+                            }
+                            .padding(.horizontal, 4)
+                            .padding(.bottom, 12)
                         }
                     } header: {
-                        HStack {
-                            Text(section.title).font(.headline)
-                            Spacer()
-                            Text("\(section.photos.count)").foregroundStyle(.secondary)
-                        }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 6)
-                        .background(.bar)
+                        PhotoSectionHeader(section: section, model: model, open: open)
                     }
                 }
             }
-            .padding(4)
         }
         .overlay {
             if model.ready && model.files.isEmpty {
                 Placeholder(title: "No photos are stored on this iPhone", systemImage: "photo")
             }
         }
-        .navigationSubtitle("\(model.files.count) photos")
+        .onExitCommand { model.selection = [] }
+        .navigationSubtitle(subtitle)
         .toolbar {
             // No upload or delete: changing DCIM directly bypasses the Photos database and can corrupt the library.
             ToolbarItemGroup {
                 Group {
+                    Picker("Group by", selection: $model.grouping) {
+                        ForEach(PhotoGrouping.allCases) { Text($0.label).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .help("Group photos by day, month or year")
+
+                    Button {
+                        model.expanded = model.expanded.isEmpty ? Set(model.photoSections.map(\.id)) : []
+                    } label: {
+                        model.expanded.isEmpty
+                            ? Label("Expand All", systemImage: "rectangle.expand.vertical")
+                            : Label("Collapse All", systemImage: "rectangle.compress.vertical")
+                    }
+                    .help(model.expanded.isEmpty ? "Expand all groups" : "Collapse all groups")
+
                     Button { Task { await model.refresh() } } label: { Label("Refresh", systemImage: "arrow.clockwise") }
+
+                    Button { choosingDates = true } label: { Label("Select Dates…", systemImage: "calendar") }
+                        .help("Select every photo between two dates")
+                        .popover(isPresented: $choosingDates, arrowEdge: .bottom) {
+                            DateRangePicker(model: model) { choosingDates = false }
+                        }
+
                     Button { model.selection = Set(model.files.map(\.id)) } label: { Label("Select All", systemImage: "checkmark.circle") }
                         .keyboardShortcut("a")
                     Button { Task { await model.download(model.selection) } } label: {
@@ -161,13 +187,166 @@ struct PhotoGallery: View {
         }
     }
 
-    /// Matches Finder: ⌘-click toggles, a plain click selects only this photo.
-    private func select(_ photo: RemoteFile) {
-        if NSEvent.modifierFlags.contains(.command) {
-            model.selection.formSymmetricDifference([photo.id])
-        } else {
-            model.selection = [photo.id]
+    private var subtitle: String {
+        let total = "\(model.files.count.formatted()) photos"
+        return model.selection.isEmpty ? total : "\(total), \(model.selection.count.formatted()) selected"
+    }
+}
+
+/// A collapsed group still reads as photos: its header carries a contact strip of the first few thumbnails.
+struct PhotoSectionHeader: View {
+    let section: PhotoSection
+    @ObservedObject var model: BrowserModel
+    let open: Bool
+
+    private static let stripCount = 8
+
+    var body: some View {
+        let selected = model.selectedCount(in: section)
+        HStack(spacing: 10) {
+            Button {
+                model.toggleExpanded(section, all: NSEvent.modifierFlags.contains(.option))
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(open ? 90 : 0))
+                        .frame(width: 12)
+                    // A fixed title column per grouping keeps the contact strips lined up down the list.
+                    Text(section.title)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .frame(minWidth: titleWidth, alignment: .leading)
+                        .fixedSize()
+                    if !open {
+                        ContactStrip(photos: Array(section.photos.prefix(Self.stripCount)), model: model)
+                    }
+                    Spacer(minLength: 8)
+                    Text(countLabel(selected))
+                        .font(.callout)
+                        .monospacedDigit()
+                        .foregroundStyle(selected > 0 ? Color.accentColor : .secondary)
+                        .lineLimit(1)
+                        .fixedSize()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(open ? "Collapse. Option-click to collapse every group." : "Expand. Option-click to expand every group.")
+            .accessibilityLabel("\(section.title), \(countLabel(selected))")
+            .accessibilityValue(open ? "Expanded" : "Collapsed")
+
+            Button {
+                model.toggleSection(section, shift: NSEvent.modifierFlags.contains(.shift))
+            } label: {
+                Image(systemName: selected == 0 ? "circle" : selected == section.photos.count ? "checkmark.circle.fill" : "minus.circle.fill")
+                    .font(.system(size: 17))
+                    .foregroundStyle(selected == 0 ? Color.secondary : Color.accentColor)
+            }
+            .buttonStyle(.plain)
+            .help(selected == section.photos.count
+                  ? "Deselect this group"
+                  : "Select this group. Shift-click to select everything since your last click.")
+            .accessibilityLabel(selected == section.photos.count ? "Deselect \(section.title)" : "Select \(section.title)")
         }
+        .padding(.horizontal, 12)
+        .frame(height: 44)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
+        .animation(.easeOut(duration: 0.15), value: open)
+    }
+
+    private var titleWidth: CGFloat {
+        switch model.grouping {
+        case .day: return 220
+        case .month: return 140
+        case .year: return 48
+        }
+    }
+
+    private func countLabel(_ selected: Int) -> String {
+        let total = section.photos.count
+        if selected == 0 { return total == 1 ? "1 photo" : "\(total.formatted()) photos" }
+        return "\(selected.formatted()) of \(total.formatted()) selected"
+    }
+}
+
+struct ContactStrip: View {
+    let photos: [RemoteFile]
+    let model: BrowserModel
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(photos) { photo in
+                StripThumb(photo: photo, model: model)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .accessibilityHidden(true)
+    }
+}
+
+struct StripThumb: View {
+    let photo: RemoteFile
+    let model: BrowserModel
+    @State private var image: NSImage?
+
+    var body: some View {
+        Color.secondary.opacity(0.15)
+            .frame(width: 28, height: 28)
+            .overlay {
+                if let image { Image(nsImage: image).resizable().scaledToFill() }
+            }
+            .clipped()
+            .task(id: photo.id) { image = await model.thumbnail(for: photo) }
+    }
+}
+
+struct DateRangePicker: View {
+    @ObservedObject var model: BrowserModel
+    let done: () -> Void
+    @State private var from = Date()
+    @State private var through = Date()
+
+    var body: some View {
+        let count = model.photos(from: from, through: through).count
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Select photos taken between").font(.headline)
+            Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 8) {
+                GridRow {
+                    Text("From").foregroundStyle(.secondary)
+                    DatePicker("From", selection: $from, in: span, displayedComponents: .date).labelsHidden()
+                }
+                GridRow {
+                    Text("Through").foregroundStyle(.secondary)
+                    DatePicker("Through", selection: $through, in: span, displayedComponents: .date).labelsHidden()
+                }
+            }
+            HStack {
+                Spacer()
+                Button("Cancel", action: done).keyboardShortcut(.cancelAction)
+                Button(count == 1 ? "Select 1 Photo" : "Select \(count.formatted()) Photos") {
+                    model.selectDates(from: from, through: through)
+                    done()
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(count == 0)
+            }
+        }
+        .padding(16)
+        .frame(width: 300)
+        .onAppear {
+            // Start from the newest month, the range people most often want to pull off the phone.
+            guard let span = model.dateSpan else { return }
+            through = span.upperBound
+            from = max(span.lowerBound, Calendar.current.date(byAdding: .month, value: -1, to: span.upperBound) ?? span.lowerBound)
+        }
+    }
+
+    private var span: ClosedRange<Date> {
+        guard let s = model.dateSpan else { return Date()...Date() }
+        return Calendar.current.startOfDay(for: s.lowerBound)...s.upperBound
     }
 }
 
